@@ -41,3 +41,9 @@ yarn-error.log*
 
 # App
 bin
+
+# ESP32 firmware (local WiFi credentials + device token live here)
+firmware/**/secrets.h
+
+# PlatformIO
+firmware/.pio/

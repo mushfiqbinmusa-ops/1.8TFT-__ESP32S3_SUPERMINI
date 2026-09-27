@@ -321,6 +321,7 @@ func main() {
 	protectedApi.DELETE("/devices/:id", deviceHandler.DeleteDevice)
 	protectedApi.POST("/devices/:id/push", deviceHandler.PushToDevice)
 	protectedApi.POST("/devices/:id/refresh", deviceHandler.RefreshDevice)
+	protectedApi.POST("/devices/:id/sync", deviceHandler.SyncDeviceNow)
 	protectedApi.GET("/devices/:id/config", ih.GetDeviceConfig)
 	protectedApi.PUT("/devices/:id/config", ih.UpdateDeviceConfig)
 	protectedApi.GET("/devices/:id/albums", deviceHandler.GetDeviceAlbums)

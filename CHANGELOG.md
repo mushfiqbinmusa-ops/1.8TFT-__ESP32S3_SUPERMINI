@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Full-colour bypass for non-e-paper panels.** The whole image pipeline
+  was built for e-paper, and every photo went through
+  `epaper-image-convert` — which can only emit the 6-colour ACeP palette or
+  a 16-step grey ramp. On a panel that can show 65,536 colours that is a
+  downgrade, not a feature. A new per-device **Full Colour** toggle
+  (Settings → Devices → Display Settings) scales the image in-process with
+  CatmullRom and sends a truecolour PNG, skipping the converter entirely,
+  the same way the `fractal` and `dla` generative sources already did.
+  Fit/cover composition and the letterbox background are reproduced, so a
+  colour frame is composed the same as a dithered one. Frames may also
+  declare it themselves with `"full_colour": true` in
+  `GET /api/system-info`; that turns the bypass on but never off, so the
+  operator can still switch it back off. Defaults to off, so no existing
+  e-paper frame changes behaviour.
+
 ## v1.16.0
 
 ### Added

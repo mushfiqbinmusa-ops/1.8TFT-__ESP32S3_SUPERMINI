@@ -1,13 +1,62 @@
-version: '3.8'
+# Single-container deployment: the Go binary serves the REST API and the built
+# Vue SPA from /app/static, so one process covers both the "heart" (backend) and
+# the web UI. See Dockerfile ENV STATIC_DIR.
+#
+#   docker compose up -d --build    # build + start
+#   docker compose ps               # health + published port
+#   docker compose logs -f          # follow
+#   docker compose down             # stop
+#
+# `version:` was removed deliberately: Compose v2+ ignores it and warns on every
+# invocation. The daemon here is v5.5.1.
+
 services:
   photoframe-server:
-    build: .
+    build:
+      context: .
+      args:
+        # Stamped into the binary and surfaced via /api/status and the webapp
+        # footer. Defaults to the last released version marked unreleased; CI
+        # overrides this with the git tag (see .github/workflows/ci.yml).
+        VERSION: ${PF_VERSION:-1.16.0-unreleased}
+        # Baked into the Vite build, so the web UI knows which port the server
+        # is reachable on. Must match the published port below.
+        ADDON_PORT: "9607"
     image: photoframe-server:latest
     container_name: photoframe-server
     restart: unless-stopped
+
     ports:
       - "9607:9607"
+
     volumes:
+      # The SQLite database and all photo originals live here. This is the only
+      # stateful thing in the deployment — everything else is rebuilt from the
+      # image, so this is also the only directory worth backing up.
       - ./data:/data
+
     environment:
       - DB_PATH=/data/photoframe.db
+      - DATA_DIR=/data
+      - PORT=9607
+      # The image ships tzdata, but without this the container logs and formats
+      # times in UTC while the host is Asia/Dhaka (+06:00). The frame's own
+      # "post-rotate wait" windows and the server's schedule rules are both
+      # wall-clock sensitive, so this is not cosmetic.
+      - TZ=Asia/Dhaka
+
+    # /api/status is registered outside the JWT-protected group
+    # (backend/main.go, HealthCheck), so this needs no credentials. The
+    # interval starts after the 10s grace period to cover SQLite's WAL
+    # recovery and the migration run on a cold start.
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9607/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # SQLite runs in WAL mode with synchronous=NORMAL. A default 10s SIGTERM
+    # window can cut a checkpoint short; the -wal file survives, but giving it
+    # room avoids a recovery pass on every stop.
+    stop_grace_period: 30s

@@ -1,0 +1,50 @@
+# Boot-time launcher for the photo frame server.
+#
+# Install with:
+#     sudo cp deploy/photoframe.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now photoframe.service
+#
+# Why this exists, given docker-compose.yml already says `restart: unless-stopped`:
+#
+#   `unless-stopped` restarts the container when the Docker daemon starts, but
+#   it deliberately does NOT restart a container that was *manually* stopped.
+#   So one `make down`, `docker compose stop`, or `docker stop` anywhere in the
+#   life of this machine leaves the frame's server dead across every subsequent
+#   reboot until someone remembers to bring it back by hand. Nothing recreates
+#   the container either, if it is ever removed rather than stopped.
+#
+#   This unit closes both holes: at every boot it runs `compose up -d`, which
+#   creates the container if it is missing and starts it if it merely exists but
+#   is stopped.
+#
+# `--no-build` is deliberate. At boot the image must already be present; building
+#   would mean reaching a registry over a network that may not be up yet, and a
+#   failed build would leave the frame with no server at all. Rebuilds are an
+#   explicit, interactive action: `make up-build`.
+
+[Unit]
+Description=ESP32 PhotoFrame Server (Docker Compose)
+Documentation=file:///home/mushfiq/esp32-photoframe-server/README.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# compose resolves `./data` relative to the project directory, so the working
+# directory is required for the database bind mount to land in the right place.
+WorkingDirectory=/home/mushfiq/esp32-photoframe-server
+
+ExecStart=/usr/bin/docker compose up -d --no-build
+ExecStop=/usr/bin/docker compose stop
+
+# Generous, because the first start on a cold boot runs SQLite WAL recovery and
+# the schema migrations. A default 90s is uncomfortably close on slow SD cards.
+TimeoutStartSec=180
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

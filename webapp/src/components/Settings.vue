@@ -1065,6 +1065,16 @@
                           @click="editDevice(device)"
                         ></v-btn>
                         <v-btn
+                          color="primary"
+                          variant="text"
+                          size="small"
+                          :icon="isSyncing(device.id) ? undefined : 'mdi-sync'"
+                          :loading="isSyncing(device.id)"
+                          title="Fetch a new image now"
+                          :disabled="isSyncing(device.id)"
+                          @click="syncDevice(device)"
+                        ></v-btn>
+                        <v-btn
                           color="error"
                           variant="text"
                           size="small"
@@ -1149,6 +1159,16 @@
                           icon="mdi-pencil"
                           title="Edit Device"
                           @click="editDevice(device)"
+                        ></v-btn>
+                        <v-btn
+                          color="primary"
+                          variant="text"
+                          size="small"
+                          :icon="isSyncing(device.id) ? undefined : 'mdi-sync'"
+                          :loading="isSyncing(device.id)"
+                          title="Fetch a new image now"
+                          :disabled="isSyncing(device.id)"
+                          @click="syncDevice(device)"
                         ></v-btn>
                         <v-btn
                           color="error"
@@ -1288,6 +1308,34 @@
                               variant="outlined"
                               density="compact"
                             ></v-select>
+                          </v-col>
+                        </v-row>
+                        <!-- Image source. This is the only field that decides
+                             what is on the glass: the frame always fetches
+                             {SERVER}/image and the server picks the picture
+                             from this value. It used to live in the Auto Rotate
+                             tab, behind a "use this server" checkbox, behind
+                             rotation_mode === 'url', and disabled outright
+                             unless auto-rotate was enabled -- four conditions
+                             deep for a field that has nothing to do with
+                             rotation. It also silently wrote an empty string
+                             when those conditions were not met, which made
+                             /image answer 400 and left the frame retrying a
+                             source that no longer existed. -->
+                        <v-row>
+                          <v-col cols="12" md="6">
+                            <v-select
+                              v-model="selectedSource"
+                              :items="sourceOptions"
+                              label="Image Source"
+                              variant="outlined"
+                              density="compact"
+                              hide-details
+                            ></v-select>
+                            <div class="text-caption text-medium-emphasis mt-1">
+                              Where this frame's pictures come from. Saved
+                              independently of Auto Rotate.
+                            </div>
                           </v-col>
                         </v-row>
                         <!-- Time zone (#128). The frame stores a POSIX TZ
@@ -1663,18 +1711,19 @@
                               :disabled="!deviceConfig.auto_rotate"
                             />
 
-                            <!-- This server: source dropdown -->
-                            <v-select
+                            <!-- The image source itself is edited once, in the
+                                 General tab. Repeating the dropdown here meant
+                                 two controls wrote the same device field, and
+                                 whichever one the user happened to open last
+                                 won. This is a read-only echo instead. -->
+                            <div
                               v-if="useThisServer"
-                              v-model="selectedSource"
-                              :items="sourceOptions"
-                              label="Image Source"
-                              variant="outlined"
-                              density="compact"
-                              hide-details
-                              class="mb-2 ml-8"
-                              :disabled="!deviceConfig.auto_rotate"
-                            ></v-select>
+                              class="text-caption text-medium-emphasis ml-8 mb-2"
+                            >
+                              Image source is set in the General tab: currently
+                              <strong>{{ sourceTitle(selectedSource) }}</strong
+                              >.
+                            </div>
 
                             <!-- Per-frame album selection for the chosen source -->
                             <div
@@ -1839,6 +1888,22 @@
                             hide-details
                             class="mt-2 mb-1"
                           ></v-checkbox>
+                          <v-checkbox
+                            v-model="editingDevice.full_colour"
+                            label="Full Colour (skip e-paper dithering)"
+                            color="primary"
+                            hide-details
+                            class="mt-2 mb-1"
+                          ></v-checkbox>
+                          <div
+                            v-if="editingDevice.full_colour"
+                            class="text-caption text-medium-emphasis mt-1 mb-2"
+                          >
+                            Photos are scaled and sent as truecolour PNGs.
+                            epaper-image-convert is bypassed entirely, so the
+                            tone, dither and palette controls below have no
+                            effect. Leave this off for e-paper frames.
+                          </div>
                         </div>
 
                         <v-divider class="my-4" />
@@ -2580,6 +2645,7 @@ import {
   setDeviceHttpPassword,
   changeFramePassword,
   refreshDevice,
+  syncDeviceNow,
   type Device,
   createURLSource,
   updateURLSource,
@@ -2847,7 +2913,12 @@ async function turnOffFramePassword() {
   await sendFramePassword('');
 }
 
-const selectedSource = ref('immich');
+// Defaults to the gallery rather than Immich. Immich needs a configured,
+// reachable server; the gallery only needs the local upload directory, so it
+// is the one source that can always render something. The old default meant a
+// device opened with no source set would silently be saved as Immich and then
+// render nothing.
+const selectedSource = ref('gallery');
 const sourceOptions = [
   { title: 'Gallery', value: 'gallery' },
   { title: 'Immich', value: 'immich' },
@@ -2860,6 +2931,12 @@ const sourceOptions = [
   { title: 'Fractal (Mandelbrot zoom)', value: 'fractal' },
   { title: 'DLA (diffusion-limited aggregation)', value: 'dla' },
 ];
+
+// Human-readable name for a source key, for the read-only echo in the Auto
+// Rotate tab. Falls back to the raw key so an unknown or legacy value is still
+// visible rather than rendering as blank.
+const sourceTitle = (value: string): string =>
+  sourceOptions.find((o) => o.value === value)?.title ?? value ?? 'not set';
 
 // URL Proxy State
 const urlSources = ref<any[]>([]); // Renamed from urlImages
@@ -3629,6 +3706,7 @@ const openAddDeviceDialog = () => {
     height: 0,
     orientation: '',
     enable_collage: false,
+    full_colour: false,
     show_date: false,
     show_photo_date: false,
     show_weather: false,
@@ -3790,6 +3868,7 @@ const saveDevice = async () => {
         show_calendar: editingDevice.show_calendar || false,
         calendar_id: editingDevice.calendar_id || '',
         date_format: editingDevice.date_format || '',
+        full_colour: editingDevice.full_colour || false,
         http_password: deviceHttpPassword.value || undefined,
       });
       deviceHttpPassword.value = '';
@@ -3806,12 +3885,20 @@ const saveDevice = async () => {
       }
     } else {
       if (!editingDevice.id) return;
-      // Per-device source: stored on the device record when this server is the
-      // URL image source; empty otherwise.
+      // Per-device source, always persisted.
+      //
+      // This used to be written as '' whenever the source was not "this server
+      // in URL rotation mode", which is most of the time. The server answers
+      // /image with 400 when a device has no source, so merely opening this
+      // dialog and saving could silently take a working frame offline. The
+      // field is now edited unconditionally in the General tab, so save what
+      // the user picked. An empty string is only honoured for a device that
+      // genuinely has no source yet, and even then it falls back to the value
+      // already on record rather than erasing it.
       const deviceSource =
-        useThisServer.value && deviceConfig.rotation_mode === 'url'
-          ? selectedSource.value
-          : '';
+        selectedSource.value ||
+        editingDevice.source ||
+        (useThisServer.value ? 'gallery' : '');
       // Save server-side device fields
       await updateDevice(
         editingDevice.id,
@@ -3833,7 +3920,8 @@ const saveDevice = async () => {
         editingDevice.calendar_id || '',
         editingDevice.date_format || '',
         deviceSource,
-        deviceProcessing.backgroundColor || ''
+        deviceProcessing.backgroundColor || '',
+        editingDevice.full_colour || false
       );
 
       // Save device remote config (config + processing + palette)
@@ -4065,6 +4153,32 @@ const removeDevice = async (id: number) => {
     showMessage('Device removed');
   } catch (e) {
     showMessage('Failed to remove device', true);
+  }
+};
+
+// Set of device ids currently being asked to sync, so the button can show a
+// per-row spinner instead of blocking the whole list.
+const syncingDevices = ref<Set<number>>(new Set());
+
+const isSyncing = (id: number) => syncingDevices.value.has(id);
+
+const syncDevice = async (device: Device) => {
+  if (syncingDevices.value.has(device.id)) return;
+  // The frame's /api/sync is synchronous: it downloads and decodes the image
+  // before replying, so this genuinely can take a while. The per-row spinner
+  // is what makes that legible — without it the button looks broken.
+  syncingDevices.value = new Set(syncingDevices.value).add(device.id);
+  try {
+    await syncDeviceNow(device.id);
+    showMessage(`${device.name} is fetching a new image`);
+  } catch (e: any) {
+    const msg =
+      e?.response?.data?.error || 'Failed to reach the frame. Is it online?';
+    showMessage(msg, true);
+  } finally {
+    const next = new Set(syncingDevices.value);
+    next.delete(device.id);
+    syncingDevices.value = next;
   }
 };
 

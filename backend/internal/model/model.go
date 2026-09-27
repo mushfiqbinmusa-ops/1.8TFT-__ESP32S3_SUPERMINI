@@ -71,7 +71,14 @@ type Device struct {
 	BoardName   string `json:"board_name"`
 	// Display color model reported by the device: "spectra6" (6-color ACeP),
 	// "gc16" (16-level grayscale / IT8951), or "" (legacy, treated as spectra6).
-	DisplayType   string  `json:"display_type" gorm:"default:''"`
+	DisplayType string `json:"display_type" gorm:"default:''"`
+	// FullColour bypasses the epaper-image-convert dithering pipeline and
+	// serves a truecolour PNG. The converter's only outputs are the 6-colour
+	// ACeP palette and a 16-step grey ramp, both of which are a downgrade on a
+	// panel that can show 65,536 colours. Reported by the device as
+	// "full_colour": true in GET /api/system-info; see
+	// service.DeviceService.Refresh for how that interacts with the UI toggle.
+	FullColour    bool    `json:"full_colour" gorm:"default:false"`
 	EnableCollage bool    `json:"enable_collage"` // Per-device collage setting
 	ShowDate      bool    `json:"show_date"`
 	ShowPhotoDate bool    `json:"show_photo_date"`

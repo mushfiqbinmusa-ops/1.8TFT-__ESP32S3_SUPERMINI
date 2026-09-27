@@ -1,4 +1,83 @@
-.PHONY: format format-check install-hooks build run dev
+.PHONY: format format-check install-hooks build run dev \
+        up up-build down restart logs ps sync backup shell test test-go test-web
+
+# --- Docker Compose (the normal way to run this project) ---------------------
+#
+# One container serves both the Go API and the built Vue SPA, which is also what
+# the Home Assistant add-on ships. `up` starts it in the background and the
+# compose file's restart:unless-stopped keeps it up across reboots.
+#
+# Use `make run` (below) only if you specifically want a raw container without
+# the healthcheck, TZ and stop-grace-period settings that compose adds.
+
+up:
+	docker compose up -d
+
+# Rebuild the image first. Use this after pulling code changes.
+up-build:
+	docker compose up -d --build
+
+down:
+	docker compose down
+
+restart:
+	docker compose restart
+
+logs:
+	docker compose logs -f
+
+ps:
+	docker compose ps
+
+# Copy the database out before anything destructive. This is the only stateful
+# thing in the deployment, so it is the only thing worth backing up. The -wal and
+# -shm files are part of a live SQLite database in WAL mode: copying only the .db
+# would capture a torn state.
+backup:
+	@mkdir -p data/backup-$$(date +%Y%m%d-%H%M%S) && \
+	cp -a data/photoframe.db data/photoframe.db-wal data/photoframe.db-shm \
+	      data/backup-$$(date +%Y%m%d-%H%M%S)/ 2>/dev/null || true; \
+	echo "Backed up to data/backup-$$(date +%Y%m%d-%H%M%S)/"
+
+shell:
+	docker compose exec photoframe-server sh
+
+# Tell the frame to fetch a new image right now, without going through the web
+# UI. Talks to the frame's own /api/sync directly, so it needs no login and does
+# not depend on the server being up.
+#
+# Override the address if the frame is not at .50:
+#     make sync PF_FRAME_HOST=192.168.0.120
+PF_FRAME_HOST ?= 192.168.0.50
+
+# The frame handles this synchronously -- it downloads and decodes the image
+# before replying -- so the timeout has to be generous. 180s covers the
+# firmware's worst case (two 45s fetch attempts).
+sync:
+	@curl -sS -m 180 "http://$(PF_FRAME_HOST)/api/sync" && echo
+
+# --- Verification ------------------------------------------------------------
+#
+# Go is not installed on a host that only runs the container, so the toolchain
+# comes from the same image the build uses. go-sqlite3 needs CGO, hence the
+# gcc/musl-dev install.
+
+test-go:
+	docker run --rm -v "$(PWD):/src" -w /src -e CGO_ENABLED=1 \
+		golang:1.24-alpine sh -c \
+		"apk add --no-cache gcc musl-dev >/dev/null && \
+		 echo '== gofmt ==' && test -z \"\$$(gofmt -l backend/)\" && \
+		 echo '== go vet ==' && go vet ./... && \
+		 echo '== go test ==' && go test ./..."
+
+test-web:
+	cd webapp && npm run type-check && npm run format:check && npm run test
+
+test: test-go test-web
+
+# --- Native (no Docker) ------------------------------------------------------
+# Both of these need Go and Node on the host; keep them for when you are not
+# using the container.
 
 format:
 	@echo "Formatting Go code..."

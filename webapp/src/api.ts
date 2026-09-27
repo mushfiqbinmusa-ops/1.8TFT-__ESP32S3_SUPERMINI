@@ -86,6 +86,10 @@ export interface Device {
   // Display color model reported by the device: "gc16" (16-level grayscale),
   // "spectra6" (6-color), or undefined for legacy firmware (treated as color).
   display_type?: string;
+  // Bypasses the e-paper dithering pipeline and serves a truecolour PNG, for
+  // panels that can show more than 6 colours. Reported by the device as
+  // "full_colour": true in its /api/system-info.
+  full_colour?: boolean;
   created_at: string;
   model?: any;
 }
@@ -109,6 +113,8 @@ export const addDevice = async (params: {
   show_calendar?: boolean;
   calendar_id?: string;
   date_format?: string;
+  // Bypasses the e-paper dithering pipeline; see Device.full_colour.
+  full_colour?: boolean;
   // Only needed when the frame requires a password on its own HTTP API.
   http_password?: string;
 }) => {
@@ -173,7 +179,8 @@ export const updateDevice = async (
   calendarId?: string,
   dateFormat?: string,
   source?: string,
-  backgroundColor?: string
+  backgroundColor?: string,
+  fullColour?: boolean
 ) => {
   const response = await api.put(`/devices/${id}`, {
     name,
@@ -195,6 +202,7 @@ export const updateDevice = async (
     date_format: dateFormat || '',
     source: source || '',
     background_color: backgroundColor || '',
+    full_colour: fullColour || false,
   });
   return response.data;
 };
@@ -203,6 +211,15 @@ export const updateDevice = async (
 // palette) from the device. Requires the device to be online.
 export const refreshDevice = async (id: number) => {
   const response = await api.post(`/devices/${id}/refresh`);
+  return response.data;
+};
+
+// Asks the frame to fetch a new image right now instead of waiting out its
+// refresh interval. The frame's /api/sync is synchronous — it downloads and
+// decodes before responding — so this can take up to a couple of minutes on a
+// slow server. Keep a spinner up for the duration.
+export const syncDeviceNow = async (id: number) => {
+  const response = await api.post(`/devices/${id}/sync`);
   return response.data;
 };
 

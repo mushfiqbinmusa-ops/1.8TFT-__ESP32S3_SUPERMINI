@@ -342,6 +342,10 @@ type SystemInfo struct {
 	// Display color model: "spectra6" (6-color), "gc16" (16-level grayscale),
 	// or "" for legacy firmware (treated as spectra6).
 	DisplayType string `json:"display_type"`
+	// FullColour reports that the panel can display truecolour, which lets the
+	// server skip the e-paper dithering pipeline. Absent from legacy firmware,
+	// where it decodes as false and the pipeline runs as before.
+	FullColour bool `json:"full_colour"`
 }
 
 func (c *Client) FetchSystemInfo() (*SystemInfo, error) {
@@ -373,6 +377,60 @@ func (c *Client) FetchSystemInfo() (*SystemInfo, error) {
 	}
 
 	return &info, nil
+}
+
+// syncTimeout is the ceiling for TriggerSync. The firmware's /api/sync handler
+// runs the fetch synchronously inside its HTTP handler, so the response only
+// arrives once the image has been downloaded, cached and decoded. That is up to
+// two 45s HTTP attempts against the server, which overruns the shared client's
+// 120s timeout once DNS, TCP and TLS setup are counted. Overshooting here is
+// only ever harmless: the frame has already finished the work by the time we
+// give up on waiting for the ack, so the image is on the panel either way.
+const syncTimeout = 180 * time.Second
+
+// TriggerSync asks the frame to fetch a new image right now instead of waiting
+// out its refresh interval. This is the "Sync now" action: the user just
+// uploaded a photo and does not want to wait up to REFRESH_INTERVAL_MS (15 min
+// on the current firmware) to see it.
+//
+// The frame picks the image through the normal GET /image path, so whatever
+// the device's source and rotation rules select is what lands on the panel.
+// This is deliberately NOT the same as PushImage, which uploads one specific
+// already-rendered image; that endpoint is a multipart POST to
+// /api/display-image, which the current firmware only serves over GET.
+func (c *Client) TriggerSync() error {
+	ip, err := c.resolveHost(c.host)
+	if err != nil {
+		return fmt.Errorf("failed to resolve device %s: %w", c.host, err)
+	}
+
+	url := fmt.Sprintf("http://%s/api/sync", ip)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Host = c.host
+
+	// Reuse the shared transport (so the frame's basic-auth password is
+	// attached when one is set) but override the timeout.
+	hc := &http.Client{
+		Transport: c.httpClient.Transport,
+		Timeout:   syncTimeout,
+	}
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to request sync from %s: %w", c.host, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("device returned status: %d", resp.StatusCode)
+	}
+
+	// Drain so the connection can be reused rather than torn down.
+	io.Copy(io.Discard, resp.Body)
+	return nil
 }
 
 type ProcessingSettings struct {

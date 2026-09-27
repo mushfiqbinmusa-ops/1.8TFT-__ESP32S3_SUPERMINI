@@ -2,6 +2,22 @@
 
 A image server for the [ESP32 PhotoFrame](https://github.com/aitjcize/esp32-photoframe) project. This server acts as a bridge between the E-paper display and various photo sources (Google Photos, Immich, Synology Photos, Unsplash, Pexels, and more), handling image processing, resizing, dithering, and overlay generation.
 
+## Acknowledgements
+
+This project is built on the original work of **[Wei-Ning Huang (@aitjcize)](https://github.com/aitjcize)**.
+
+- **Upstream server:** <https://github.com/aitjcize/esp32-photoframe-server>
+- **Upstream firmware:** <https://github.com/aitjcize/esp32-photoframe>
+
+All original design, the Go/Vue application, the image-processing pipeline, and the
+E-paper firmware protocol belong to that project. The upstream repository remains
+the canonical source; please raise bugs and feature requests there, and consider
+supporting the author if you find it useful.
+
+This repository is a derivative that adds work specific to driving a
+**1.8" ST7735 colour TFT** frame on a **Raspberry Pi 5** — see
+[Customizations in this fork](#customizations-in-this-fork).
+
 ## Features
 
 ### Supported Sources
@@ -78,6 +94,147 @@ docker run -d \
   --name photoframe-server \
   aitjcize/esp32-photoframe-server:latest
 ```
+
+### Raspberry Pi 5 (Docker Compose)
+
+`docker-compose.yml` in this repository builds the Go API and the Vue web UI into
+a **single image** that serves both, and runs it with `restart: unless-stopped`.
+
+```bash
+docker compose up -d --build   # build and start
+docker compose ps              # health + published port
+docker compose logs -f         # follow
+make up-build                  # same thing, via the Makefile
+```
+
+The database and all uploaded photos live in `./data`, bind-mounted to `/data`.
+That is the **only** stateful directory — back it up with `make backup`.
+
+#### Starting automatically on boot
+
+Installing the bundled systemd unit makes the server come up on every boot:
+
+```bash
+sudo cp deploy/photoframe.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now photoframe.service
+```
+
+> [!IMPORTANT]
+> The unit exists because `restart: unless-stopped` has a gap. It restarts the
+> container when the Docker daemon starts, but it deliberately does **not**
+> restart a container that was *manually* stopped. One `make down`,
+> `docker compose stop`, or `docker stop` anywhere in the life of the machine
+> leaves the frame's server dead across every later reboot. The unit runs
+> `docker compose up -d` at boot, which creates the container if it is missing
+> and starts it if it merely exists but is stopped.
+
+It also uses `--no-build` on purpose: at boot the image must already be present,
+and building would mean reaching a registry over a network that may not be up
+yet. Rebuilds stay an explicit, interactive action.
+
+### Troubleshooting on a Raspberry Pi 5
+
+#### `docker pull` fails with `dial tcp [2600:...]:443: socket: address family not supported by protocol`
+
+The most confusing failure on a Pi, and almost never a Docker problem. Some
+routers return a **malformed A record** for registry hostnames while returning
+perfectly good AAAA records. Go's resolver, which the Docker daemon uses, then
+has no usable IPv4 to fall back on, tries the unreachable IPv6 address, and
+fails with a message that blames IPv6. Plain `curl` on the same host succeeds,
+which is what makes it look like a Docker bug.
+
+Confirm the router is at fault by asking it directly — a correct A answer looks
+like an IP, not text:
+
+```bash
+dig +short @192.168.0.1 A registry-1.docker.io
+# broken:  ";; Warning: Message parser reports malformed message packet" + garbage
+# healthy: "54.209.93.113"
+```
+
+Fix it at the resolver that the system actually uses. On Raspberry Pi OS that is
+NetworkManager, which **rewrites `/etc/resolv.conf` on every boot and every
+reconnect** — so editing the file by hand appears to work and then silently
+reverts:
+
+```bash
+# check which connection is live
+nmcli -t -f NAME,DEVICE con show
+
+# persistent fix: set DNS on the connection and ignore the DHCP-provided one
+sudo nmcli con mod "<your-connection>" ipv4.dns "1.1.1.1 8.8.8.8" ipv4.ignore-auto-dns yes
+
+# apply to the live link without dropping the connection
+sudo nmcli dev reapply wlan0
+```
+
+This changes DNS only — IP addressing is untouched — so an existing SSH or VNC
+session is not interrupted. Verify with `docker pull alpine:3`.
+
+> [!NOTE]
+> This only affects pulling and building. A container that is **already built**
+> starts normally on boot without any registry access, so autostart is
+> unaffected by broken DNS.
+
+#### The server is dead after a reboot
+
+Check, in order:
+
+```bash
+systemctl is-enabled photoframe.service   # want: enabled
+systemctl is-active  photoframe.service   # want: active
+docker compose ps                         # want: healthy
+```
+
+If the unit is not installed, a manually-stopped container will stay stopped
+forever — see [Starting automatically on boot](#starting-automatically-on-boot).
+
+#### The frame is unreachable for the first ~40 seconds after boot
+
+Expected, and it is not a fault. The ESP32 joins Wi-Fi well before its network
+stack is usable, so probes issued in the first seconds time out. The frame's own
+log tells the difference:
+
+```
+[wifi] connected          <- associated
+[probe] 192.168.0.1:80 -> FAILED (5001ms)   <- too early, ignore this
+```
+
+Wait about a minute before concluding the frame is dead. A healthy frame reports
+`wifi_ok: true` and a plausible RSSI from `/api/system-info`.
+
+#### The frame shows a photo but you expected a new one
+
+That is the fallback working. The frame keeps the last image it successfully
+downloaded and only replaces it when a new one actually arrives — across
+reboots, Wi-Fi loss, an unreachable server, and a failed fetch. The log says so
+explicitly:
+
+```
+[sync] first fetch FAILED: HTTP -1
+[display] restored last photo from flash
+```
+
+#### `/api/status` is fine but `/image` returns 400
+
+`no image source configured for this device`. The device has an empty source, so
+the server has nothing to render. Set it under **Settings → Devices → your frame
+→ General → Image Source**. Saving that dialog no longer clears the setting.
+
+#### Tools in `/tmp` keep disappearing
+
+`/tmp` is a **tmpfs — RAM, not disk** — so it is emptied on every reboot and
+consumes actual memory. On a 4 GB Pi that also means a large build or test
+artifact staged there competes with the desktop. Put toolchains and caches
+somewhere on the real filesystem (`~/.cache/...`) instead.
+
+#### The SD card and the database
+
+`data/photoframe.db` is SQLite in WAL mode and survives an unclean shutdown, and
+`make backup` copies the database plus its `-wal`/`-shm` sidecars together.
+Because the Pi is often left on, and because SD cards wear out, take a backup
+periodically rather than only when something breaks.
 
 ## Configuration
 
@@ -248,6 +405,57 @@ This script:
 - Syncs code to Home Assistant's local add-on directory
 - Modifies config for development (port 9608, dev slug)
 - Triggers Supervisor to rebuild and restart the add-on
+
+## Customizations in this fork
+
+Everything below is specific to this fork's goal: run a **1.8" ST7735 colour
+TFT** frame against a **Raspberry Pi 5**, resiliently. It sits on top of the
+upstream design rather than replacing it.
+
+### ESP32 firmware (`firmware/`)
+
+The upstream project targets black-and-white E-paper. This fork adds a complete
+PlatformIO project for a **ESP32-S3 SuperMini + ST7735S 128×160 SPI** display,
+driven in full colour.
+
+- **Full-colour rendering** — the frame renders the server's PNG directly instead
+  of a 1-bit dithered image. Reported to the server as `full_colour` so the server
+  can skip palette conversion.
+- **Cached-image fallback** — the last good image is kept in LittleFS and
+  re-rendered at boot whenever the first fetch fails, the server is unreachable,
+  or Wi-Fi is down. A missing server produces a stale photo, never a blank
+  screen or an error card.
+- **Direct push (`POST /api/display-image`)** — the frame can be handed an image
+  by the server as multipart form data instead of polling for one. The upload
+  handler keeps only the `image` part, discards the thumbnail, streams the body
+  through `currentSize`, writes to a temporary file, and `rename()`s it into
+  place so an interrupted push can never leave a truncated file on flash.
+- **`/api/sync` endpoint** — lets a button or automation force a refresh
+  (`make sync` targets it).
+
+### Server and web UI
+
+- **Image Source is a first-class, per-device setting.** It is now always visible
+  in **Settings → Devices → your frame → General**, instead of being buried
+  inside an Auto Rotate panel and only rendered under conditions that hid it.
+  Saving the dialog no longer blanks the source.
+- **`PUT /api/devices/:id` preserves an existing source** when the request omits
+  it. An empty source is never a useful stored value — the server answers
+  `/image` with `400` for a device that has none, so persisting `""` would quietly
+  take a working frame offline as a side effect of saving something unrelated.
+  Covered by `backend/internal/handler/device_source_test.go`.
+- **Full-colour passthrough** — `full_colour` on the device model and a migration
+  (`000040_add_device_full_colour`) let the server return a colour image when the
+  frame can display one, and a bypass on the device can be switched back off.
+- **Sync now** — a per-device action to push/refresh a frame on demand.
+
+### Deployment
+
+- **Single-image Docker build** — a multi-stage `Dockerfile` compiles the Go API
+  and the Vue UI together, with a `.dockerignore` keeping `firmware/`, `data/`,
+  `node_modules/` and toolchains out of the build context.
+- **Boot-time systemd unit** (`deploy/photoframe.service`) — see
+  [Starting automatically on boot](#starting-automatically-on-boot).
 
 ## Support
 

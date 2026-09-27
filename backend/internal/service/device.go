@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aitjcize/esp32-photoframe-server/backend/internal/model"
 	"github.com/aitjcize/esp32-photoframe-server/backend/pkg/gcalendar"
@@ -260,6 +261,14 @@ func (s *DeviceService) RefreshDeviceFromHardware(id uint) (*model.Device, error
 	if sysInfo.DisplayType != "" {
 		device.DisplayType = sysInfo.DisplayType
 	}
+	// Sticky-on, mirroring the DisplayType handling above: only a device that
+	// advertises full colour turns this on, and a frame that omits the field
+	// never turns it back off. That keeps the web UI toggle authoritative for
+	// switching the bypass off again, instead of a refresh silently reverting
+	// the operator's choice on every poll.
+	if sysInfo.FullColour {
+		device.FullColour = true
+	}
 
 	configRaw, err := pfClient.FetchConfig()
 	if err != nil {
@@ -313,6 +322,35 @@ func (s *DeviceService) DeleteDevice(id uint) error {
 }
 
 // --- Push Logic ---
+
+// SyncDeviceNow asks a frame to fetch a new image immediately rather than
+// waiting out its refresh interval. Unlike PushToDevice this renders nothing
+// server-side: the frame pulls through the ordinary GET /image path, so its
+// source, album bindings and rotation history all apply exactly as they would
+// on a scheduled refresh. That is the point -- it behaves like a refresh that
+// happened early, not like a manual override.
+func (s *DeviceService) SyncDeviceNow(id uint) error {
+	var device model.Device
+	if err := s.db.First(&device, id).Error; err != nil {
+		return errors.New("device not found")
+	}
+
+	pfClient, release, err := FrameClientAt(s.db, id, device.Host)
+	if err != nil {
+		return fmt.Errorf("failed to reach device: %w", err)
+	}
+	defer release()
+
+	if err := pfClient.TriggerSync(); err != nil {
+		return err
+	}
+
+	// Only reached if the frame answered, so this is a genuine success rather
+	// than a guess. battery_reported_at doubles as "last seen" for the UI.
+	_ = s.db.Model(&model.Device{}).Where("id = ?", id).
+		Update("battery_reported_at", time.Now()).Error
+	return nil
+}
 
 // PushToDevice resolves a device ID to a host and pushes the image
 func (s *DeviceService) PushToDevice(deviceID uint, imagePath string) error {

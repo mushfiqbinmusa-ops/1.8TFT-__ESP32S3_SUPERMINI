@@ -1,0 +1,51 @@
+# Docker build context exclusions.
+#
+# The image only needs backend/, webapp/source, go.mod, go.sum and the
+# migrations. Everything below is either dead weight or actively harmful.
+#
+# Why this file matters beyond build speed:
+#
+#   * webapp/node_modules — the Dockerfile runs `npm install` and THEN does
+#     `COPY webapp/ ./`. Without this exclusion the host's node_modules is
+#     copied over the container's freshly installed one, replacing the
+#     `--ignore-scripts` install (which has no compiled esbuild binary) with
+#     whatever the host happened to have. It tends to work on an x64 Linux
+#     host purely by coincidence and breaks on anything else. This is the
+#     single most important line in the file.
+#
+#   * firmware/esp32_s3_photoframe/secrets.h — contains the WiFi password and
+#     the device token. It is not COPYed by the Dockerfile, but excluding it
+#     guarantees it can never reach the daemon, an image layer, or a build
+#     cache entry. Treat this as a hard requirement, not a nicety.
+#
+#   * data/ — the live SQLite database. It arrives via a bind mount at
+#     runtime and must never be baked into an image.
+
+# VCS and CI
+.git
+.gitignore
+.github
+.githooks
+
+# Dependencies and build output
+webapp/node_modules
+webapp/dist
+bin
+**/.DS_Store
+**/*.log
+npm-debug.log*
+yarn-error.log*
+
+# Runtime state — bind-mounted, never baked in
+data/
+
+# ESP32 firmware: not part of the server image, and it holds the secrets
+firmware/
+
+# Agent/tooling notes and editor config
+.agent
+.vscode
+.devcontainer
+
+# Local build/compose overrides
+docker-compose.override.yml

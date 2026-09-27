@@ -6,8 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
+	"image/draw"
 	"image/png"
 	"log"
+	"math"
 
 	_ "image/jpeg"
 
@@ -17,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	xdraw "golang.org/x/image/draw"
 
 	"github.com/aitjcize/esp32-photoframe-server/backend/internal/imagesource"
 	"github.com/aitjcize/esp32-photoframe-server/backend/internal/model"
@@ -440,6 +445,35 @@ func (h *ImageHandler) ServeImage(c echo.Context) error {
 		}
 	} else {
 		imgWithOverlay = img
+	}
+
+	// Full-colour panels skip the dithering pipeline entirely. The overlay
+	// above is already composed at panel dimensions in real colour, and
+	// epaper-image-convert can only emit a 6-colour palette or a grey ramp,
+	// so on an RGB565 display the converter is a pure downgrade. Scaling is
+	// done in-process to keep the composition identical to what the
+	// converter's --scale-mode would have produced.
+	//
+	// The response is always a PNG here, whatever X-Firmware-Version asked
+	// for. EPDGZ is an e-paper encoding, so negotiating it for a full-colour
+	// panel is self-contradictory; a frame on this path should expect PNG.
+	if deviceFound && device.FullColour {
+		out := imgWithOverlay
+		if logicalW != nativeW || logicalH != nativeH {
+			out = rotate90CW(out)
+		}
+		out = fitToPanel(out, nativeW, nativeH, displayMode, backgroundColor)
+
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, out); err != nil {
+			return respondError(c, http.StatusInternalServerError, "png encode: "+err.Error())
+		}
+		body := buf.Bytes()
+
+		h.applyConfigSync(c, &device, deviceFound)
+
+		c.Response().Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		return c.Blob(http.StatusOK, "image/png", body)
 	}
 
 	// 3. Tone Mapping + Thumbnail (CLI)
@@ -892,4 +926,97 @@ func rotate90CW(src image.Image) *image.RGBA {
 		}
 	}
 	return dst
+}
+
+// fitToPanel scales src into a w×h panel image, reproducing the composition
+// epaper-image-convert's --scale-mode would have produced so that a full-colour
+// device is not visually different from a dithered one. "cover" fills the panel
+// and centre-crops; any other value fits inside it and letterboxes. CatmullRom
+// matches the resize already used by the gallery and Google Photos paths.
+func fitToPanel(src image.Image, w, h int, mode, bg string) image.Image {
+	if w <= 0 || h <= 0 {
+		return src
+	}
+	b := src.Bounds()
+	sw, sh := b.Dx(), b.Dy()
+	if sw <= 0 || sh <= 0 {
+		return src
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+
+	// Fill the whole panel first. "fit" leaves this showing through the
+	// letterbox bars; "cover" normally paints over all of it, but the
+	// integer rounding below can leave a hairline gap on the far edge when
+	// the overflow is odd, and a black seam is a worse artefact than a
+	// slightly wrong corner pixel.
+	fill := parsePanelColor(bg)
+	draw.Draw(dst, dst.Bounds(), &image.Uniform{fill}, image.Point{}, draw.Src)
+
+	if mode == "cover" {
+		// Scale so both axes are covered, then crop the overflow from the centre.
+		scale := math.Max(float64(w)/float64(sw), float64(h)/float64(sh))
+		scaled := image.NewRGBA(image.Rect(0, 0,
+			maxInt(1, int(math.Ceil(float64(sw)*scale))),
+			maxInt(1, int(math.Ceil(float64(sh)*scale)))))
+		xdraw.CatmullRom.Scale(scaled, scaled.Bounds(), src, b, draw.Src, nil)
+		// sp is the source pixel that lands on r.Min, so src(0,0) is drawn at
+		// r.Min-sp. Centring the crop therefore pushes the scaled image off
+		// the top-left, which means a POSITIVE sp here. (Getting this sign
+		// wrong clips the whole image away and leaves a blank panel, and
+		// because dst was pre-filled it fails as a plausible-looking frame of
+		// solid background rather than as an obvious error.)
+		sp := image.Point{
+			(scaled.Bounds().Dx() - w) / 2,
+			(scaled.Bounds().Dy() - h) / 2,
+		}
+		draw.Draw(dst, dst.Bounds(), scaled, sp, draw.Src)
+		return dst
+	}
+
+	// fit: scale to fit entirely inside the panel, then centre it. Here the
+	// scaled image is inset rather than outset, so sp is the negative offset.
+	scale := math.Min(float64(w)/float64(sw), float64(h)/float64(sh))
+	tw := maxInt(1, int(math.Round(float64(sw)*scale)))
+	th := maxInt(1, int(math.Round(float64(sh)*scale)))
+	scaled := image.NewRGBA(image.Rect(0, 0, tw, th))
+	xdraw.CatmullRom.Scale(scaled, scaled.Bounds(), src, b, draw.Src, nil)
+	draw.Draw(dst, dst.Bounds(), scaled,
+		image.Point{-(w - tw) / 2, -(h - th) / 2}, draw.Src)
+	return dst
+}
+
+// parsePanelColor resolves a --background-color style value into an RGBA.
+// Accepts #RGB, #RRGGBB and #RRGGBBAA, with or without the leading '#'.
+// Anything unrecognised falls back to white, which is the converter's own
+// default, so a malformed value from the UI degrades to the dithered path's
+// appearance instead of inventing a new one.
+func parsePanelColor(s string) color.RGBA {
+	white := color.RGBA{0xff, 0xff, 0xff, 0xff}
+	hex := strings.TrimPrefix(strings.TrimSpace(s), "#")
+	if hex == "" {
+		return white
+	}
+	if len(hex) == 3 {
+		// Expand the shorthand so each nibble becomes a byte.
+		hex = string([]byte{hex[0], hex[0], hex[1], hex[1], hex[2], hex[2]})
+	}
+	if len(hex) != 6 && len(hex) != 8 {
+		return white
+	}
+	v, err := strconv.ParseUint(hex, 16, 64)
+	if err != nil {
+		return white
+	}
+	if len(hex) == 6 {
+		return color.RGBA{uint8(v >> 16), uint8(v >> 8), uint8(v), 0xff}
+	}
+	return color.RGBA{uint8(v >> 24), uint8(v >> 16), uint8(v >> 8), uint8(v)}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

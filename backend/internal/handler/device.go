@@ -59,6 +59,8 @@ func (h *DeviceHandler) AddDevice(c echo.Context) error {
 		ShowCalendar  bool    `json:"show_calendar"`
 		CalendarID    string  `json:"calendar_id"`
 		DateFormat    string  `json:"date_format"`
+		// Bypasses the e-paper dithering pipeline for a colour panel.
+		FullColour bool `json:"full_colour"`
 		// Only needed when the frame requires a password on its own HTTP API.
 		HTTPPassword string `json:"http_password"`
 	}
@@ -81,6 +83,14 @@ func (h *DeviceHandler) AddDevice(c echo.Context) error {
 	device, err := h.deviceService.AddDevice(req.Host, req.HTTPPassword, req.EnableCollage, req.ShowDate, req.ShowPhotoDate, req.ShowWeather, req.WeatherLat, req.WeatherLon, req.Layout, req.DisplayMode, req.ShowCalendar, req.CalendarID, req.DateFormat)
 	if err != nil {
 		return respondError(c, http.StatusInternalServerError, err.Error())
+	}
+	// The bypass is set here rather than in AddDevice's signature, matching how
+	// UpdateDevice handles it. Written as a map so an explicit false persists.
+	if req.FullColour {
+		if err := h.db.Model(device).Update("full_colour", true).Error; err != nil {
+			return respondError(c, http.StatusInternalServerError, err.Error())
+		}
+		device.FullColour = true
 	}
 	return c.JSON(http.StatusCreated, device)
 }
@@ -214,6 +224,22 @@ func framePasswordErrorResponse(e *service.FramePasswordError) (int, string) {
 	}
 }
 
+// resolveDeviceSource decides what to persist for a device's image source.
+//
+// An empty requested value is never stored. ServeImage answers /image with 400
+// when a device has no source, so persisting "" does not mean "not configured",
+// it means "this frame is now dark and retrying a source that does not exist".
+// Any client that omits the field -- an older frontend, a partial request body,
+// a UI whose selector was hidden behind unrelated settings -- would take a
+// working frame offline as a side effect of saving something else entirely.
+// An empty value therefore preserves what is already on record.
+func resolveDeviceSource(requested, existing string) string {
+	if requested != "" {
+		return requested
+	}
+	return existing
+}
+
 // PUT /api/devices/:id
 // Updates server-owned + shared fields only. Dimensions / board name
 // come from POST /api/devices/:id/refresh.
@@ -239,6 +265,7 @@ func (h *DeviceHandler) UpdateDevice(c echo.Context) error {
 		CalendarID      string  `json:"calendar_id"`
 		DateFormat      string  `json:"date_format"`
 		Source          string  `json:"source"`
+		FullColour      bool    `json:"full_colour"`
 	}
 	if err := c.Bind(&req); err != nil {
 		return respondError(c, http.StatusBadRequest, "invalid request")
@@ -252,17 +279,24 @@ func (h *DeviceHandler) UpdateDevice(c echo.Context) error {
 	if err != nil {
 		return respondError(c, http.StatusInternalServerError, err.Error())
 	}
-	// Per-device image source + fit-mode background color for the unified
-	// /image endpoint (kept out of the long UpdateDevice signature; persisted
-	// directly).
+	// Per-device image source, fit-mode background color and the full-colour
+	// dithering bypass for the unified /image endpoint (kept out of the long
+	// UpdateDevice signature; persisted directly).
+	//
+	// full_colour is written unconditionally, including as false. Unlike
+	// DisplayType it is not device-owned: a frame reports it once, but the
+	// operator has to be able to switch the bypass back off, and a frame that
+	// omits the field must not silently re-enable it on every poll.
 	if err := h.db.Model(device).Updates(map[string]interface{}{
-		"source":           req.Source,
+		"source":           resolveDeviceSource(req.Source, device.Source),
 		"background_color": req.BackgroundColor,
+		"full_colour":      req.FullColour,
 	}).Error; err != nil {
 		return respondError(c, http.StatusInternalServerError, err.Error())
 	}
-	device.Source = req.Source
+	device.Source = resolveDeviceSource(req.Source, device.Source)
 	device.BackgroundColor = req.BackgroundColor
+	device.FullColour = req.FullColour
 	return c.JSON(http.StatusOK, device)
 }
 
@@ -292,6 +326,31 @@ func (h *DeviceHandler) DeleteDevice(c echo.Context) error {
 }
 
 // POST /api/devices/:id/push
+// SyncDeviceNow triggers an out-of-band image fetch on the frame. The frame's
+// /api/sync handler is synchronous — it does the download and decode before
+// responding — so this call can legitimately take up to a couple of minutes on
+// a slow server. The UI shows a spinner for the duration.
+func (h *DeviceHandler) SyncDeviceNow(c echo.Context) error {
+	id, _ := strconv.Atoi(c.Param("id"))
+	if err := h.deviceService.SyncDeviceNow(uint(id)); err != nil {
+		errMsg := err.Error()
+		// Reuse the existing wording so the webapp can show one consistent
+		// "device is offline" message whether the user hit Sync now or Push.
+		if strings.Contains(errMsg, "not reachable") ||
+			strings.Contains(errMsg, "failed to resolve") ||
+			strings.Contains(errMsg, "failed to reach device") {
+			return respondError(c, http.StatusServiceUnavailable,
+				"Device is not reachable. Please ensure the device is online and accessible.")
+		}
+		return respondError(c, http.StatusInternalServerError,
+			fmt.Sprintf("sync failed: %v", err))
+	}
+	return c.JSON(http.StatusOK, map[string]interface{}{
+		"ok":      true,
+		"message": "Frame is fetching a new image now.",
+	})
+}
+
 func (h *DeviceHandler) PushToDevice(c echo.Context) error {
 	deviceID, _ := strconv.Atoi(c.Param("id"))
 	var req struct {
